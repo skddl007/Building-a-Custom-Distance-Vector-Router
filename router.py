@@ -1,6 +1,8 @@
 import json
+import ipaddress
 import os
 import socket
+import subprocess
 import threading
 import time
 
@@ -101,26 +103,192 @@ def apply_kernel_route(subnt, entry):
     nxt_hop = str(entry["next_hop"])
 
     if lernd_from == "self":
-        os.system("ip route replace " + subnt + " dev eth0")
+        iface_map = discover_direct_subnet_ifaces()
+        iface = iface_map.get(subnt)
+        if iface:
+            os.system("ip route replace " + subnt + " dev " + iface)
+        else:
+            os.system("ip route del " + subnt + " >/dev/null 2>&1")
     elif distnce >= INFINITY:
         os.system("ip route del " + subnt + " >/dev/null 2>&1")
     else:
         os.system("ip route replace " + subnt + " via " + nxt_hop)
 
 
+def discover_direct_subnet_ifaces():
+    subnet_to_iface = {}
+    try:
+        addr_res = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        for line in addr_res.stdout.splitlines():
+            parts = line.strip().split()
+            if len(parts) < 4 or "inet" not in parts:
+                continue
+
+            iface = parts[1]
+            if iface == "lo":
+                continue
+
+            idx = parts.index("inet")
+            if idx + 1 >= len(parts):
+                continue
+            cidr = parts[idx + 1]
+            try:
+                subnt = str(ipaddress.ip_interface(cidr).network)
+            except ValueError:
+                continue
+
+            if subnt.startswith("127."):
+                continue
+            subnet_to_iface[subnt] = iface
+    except Exception:
+        pass
+
+    return subnet_to_iface
+
+
+def discover_iface_ipv4_cidrs():
+    iface_rows = []
+    try:
+        addr_res = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        for line in addr_res.stdout.splitlines():
+            parts = line.strip().split()
+            if len(parts) < 4 or "inet" not in parts:
+                continue
+            iface = parts[1]
+            if iface == "lo":
+                continue
+
+            idx = parts.index("inet")
+            if idx + 1 >= len(parts):
+                continue
+            cidr = parts[idx + 1]
+            try:
+                intf = ipaddress.ip_interface(cidr)
+            except ValueError:
+                continue
+
+            if intf.ip.is_loopback:
+                continue
+            iface_rows.append((iface, str(intf.ip), intf.network))
+    except Exception:
+        pass
+    return iface_rows
+
+
+def local_source_for_neighbor(neighbr_ip):
+    try:
+        neigh_ip = ipaddress.ip_address(neighbr_ip)
+    except ValueError:
+        return None
+
+    for _, local_ip, netw in discover_iface_ipv4_cidrs():
+        if neigh_ip in netw:
+            return local_ip
+    return None
+
+
+def discover_direct_subnets():
+    if DIRECT_SUBNETS:
+        return list(DIRECT_SUBNETS)
+
+    discovered = []
+    seen = set()
+    try:
+        # Prefer interface-derived subnets; these remain correct even if route
+        # entries were temporarily replaced by learned next-hop routes.
+        for subnt in discover_direct_subnet_ifaces().keys():
+            if subnt not in seen:
+                seen.add(subnt)
+                discovered.append(subnt)
+
+        res = subprocess.run(
+            ["ip", "-4", "route", "show", "scope", "link"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        for line in res.stdout.splitlines():
+            parts = line.strip().split()
+            if not parts:
+                continue
+            subnt = parts[0]
+            if "/" not in subnt:
+                continue
+            if subnt.startswith("127."):
+                continue
+            if subnt not in seen:
+                seen.add(subnt)
+                discovered.append(subnt)
+    except Exception:
+        pass
+
+    return discovered
+
+
 def init_direct_routes():
     # Seed routes we are directly connected to.
     ts = now()
+    direct_subnets = discover_direct_subnets()
     with table_lock:
-        for subnt in DIRECT_SUBNETS:
+        for subnt in direct_subnets:
             routing_table[subnt] = make_route(0, "0.0.0.0", "self", ts)
-            # Mirror it in the Linux route table too.
-            os.system("ip route replace " + subnt + " dev eth0")
-
-    if DIRECT_SUBNETS:
-        print("Direct subnets loaded:", DIRECT_SUBNETS, flush=True)
+    if direct_subnets:
+        print("Direct subnets loaded:", direct_subnets, flush=True)
     else:
         print("No direct subnets set. Using learned routes only.", flush=True)
+
+
+def refresh_direct_routes():
+    # Evaluator can attach extra interfaces after process start.
+    # Re-discover direct subnets periodically and promote them to self routes.
+    ts = now()
+    discovered = discover_direct_subnets()
+    changed = False
+
+    if not discovered:
+        return False
+
+    with table_lock:
+        discovered_set = set(discovered)
+
+        # If a previously direct network disappeared (e.g., link detach),
+        # drop the self route so Bellman-Ford can relearn alternate paths.
+        for subnt, old_rout in list(routing_table.items()):
+            if old_rout["learned_from"] == "self" and subnt not in discovered_set:
+                del routing_table[subnt]
+                changed = True
+
+        for subnt in discovered:
+            old_rout = routing_table.get(subnt)
+            if old_rout is None:
+                routing_table[subnt] = make_route(0, "0.0.0.0", "self", ts)
+                changed = True
+                continue
+
+            if (
+                old_rout["learned_from"] != "self"
+                or int(old_rout["distance"]) != 0
+                or str(old_rout["next_hop"]) != "0.0.0.0"
+            ):
+                old_rout["distance"] = 0
+                old_rout["next_hop"] = "0.0.0.0"
+                old_rout["learned_from"] = "self"
+                old_rout["last_updated"] = ts
+                changed = True
+            else:
+                old_rout["last_updated"] = ts
+
+    return changed
 
 
 def build_packet_for_neighbor(targt_neighbr):
@@ -143,13 +311,25 @@ def build_packet_for_neighbor(targt_neighbr):
 
 def broadcast_updates():
     sockt = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    src_sockets = {}
 
     while True:
+        if refresh_direct_routes():
+            apply_routes_to_kernel()
+
         for neighbr in NEIGHBORS:
             packt = build_packet_for_neighbor(neighbr)
             try:
                 raw_pkt = json.dumps(packt).encode("utf-8")
-                sockt.sendto(raw_pkt, (neighbr, PORT))
+                src_ip = local_source_for_neighbor(neighbr)
+                send_sock = sockt
+                if src_ip is not None:
+                    if src_ip not in src_sockets:
+                        bound = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        bound.bind((src_ip, 0))
+                        src_sockets[src_ip] = bound
+                    send_sock = src_sockets[src_ip]
+                send_sock.sendto(raw_pkt, (neighbr, PORT))
             except Exception as exc:
                 print("Could not send update to", neighbr, ":", exc, flush=True)
 
@@ -212,7 +392,8 @@ def apply_bellman_ford(neighbr_ip, routes_from_neighbr):
             # Different source neighbor: only switch if better.
             else:
                 old_dist = int(old_rout["distance"])
-                if new_dist < old_dist:
+                old_hop = str(old_rout["next_hop"])
+                if new_dist < old_dist or (new_dist == old_dist and neighbr_ip < old_hop):
                     # Better path found through this neighbor.
                     set_route_from_neighbor(old_rout, neighbr_ip, new_dist, ts)
                     changed = True
